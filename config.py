@@ -184,7 +184,8 @@ VFD_INIT_SEQUENCE = os.environ.get("VFD_INIT_SEQUENCE", "true").lower() == "true
 # If you later expose this dashboard over the internet, configure STUN/TURN.
 WEBRTC_STUN_URLS = [
     item.strip() for item in os.environ.get(
-        "WEBRTC_STUN_URLS", ""
+        "WEBRTC_STUN_URLS",
+        "stun:stun.l.google.com:19302,stun:stun1.l.google.com:19302",
     ).split(",") if item.strip()
 ]
 WEBRTC_TURN_URLS = [
@@ -195,16 +196,11 @@ WEBRTC_TURN_USERNAME = os.environ.get("WEBRTC_TURN_USERNAME", "")
 WEBRTC_TURN_CREDENTIAL = os.environ.get("WEBRTC_TURN_CREDENTIAL", "")
 WEBRTC_ICE_TRANSPORT_POLICY = os.environ.get("WEBRTC_ICE_TRANSPORT_POLICY", "all")
 
-# ── WebRTC ICE Configuration ──────────────────────────────
+# ICE settings above remain environment-configurable. For a local LAN,
+# STUN is normally not required; TURN should be configured for restrictive
+# NAT/firewall or internet-facing deployments.
 
-WEBRTC_STUN_URLS = [
-    "stun:stun.l.google.com:19302",
-    "stun:stun1.l.google.com:19302",
-]
-
-# TURN is optional for initial testing.
-WEBRTC_TURN_URLS = []
-WEBRTC_TURN_USERNAME = ""
-WEBRTC_TURN_CREDENTIAL = ""
-
-WEBRTC_ICE_TRANSPORT_POLICY = "all"
+# WebRTC browser delivery resolution. The RTSP source and YOLO inference remain
+# at native camera resolution. 1280x720 reduces software-encoder load on CPU.
+WEBRTC_MAX_WIDTH = int(os.environ.get("WEBRTC_MAX_WIDTH", "1280"))
+WEBRTC_MAX_HEIGHT = int(os.environ.get("WEBRTC_MAX_HEIGHT", "720"))

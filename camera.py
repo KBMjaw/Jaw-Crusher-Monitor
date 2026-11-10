@@ -1,4 +1,4 @@
-"""RTSP capture + YOLO processing with a one-slot latest-frame buffer."""
+"""Low-latency RTSP capture, YOLO inference and rate-limited JPEG preview."""
 import asyncio
 import logging
 import os
@@ -10,12 +10,17 @@ import cv2
 from ultralytics import YOLO
 
 from config import (
-    MODEL_PATH, RTSP_URL, CONF_THRESHOLD, FRAME_INTERVAL,
+    MODEL_PATH, RTSP_URL, CONF_THRESHOLD,
     SAVE_ANNOTATED, OUTPUT_DIR, HEADLESS, VFD_SPEEDS,
 )
 from crusher_logic import crusher_logic
 
 log = logging.getLogger(__name__)
+
+# The raw RTSP/WebRTC path remains at camera FPS. The JPEG preview is a
+# separate, lower-priority path used by snapshots and MJPEG fallback.
+PREVIEW_FPS = max(1.0, min(30.0, float(os.environ.get("PREVIEW_FPS", "10"))))
+PREVIEW_JPEG_QUALITY = max(30, min(95, int(os.environ.get("PREVIEW_JPEG_QUALITY", "55"))))
 
 
 class CrusherCamera:
@@ -81,7 +86,12 @@ class CrusherCamera:
         log.info("YOLO model loaded successfully")
 
     def _infer(self, frame):
-        """Return (annotated_frame, label, confidence, inference_ok)."""
+        """Return (annotated_frame_or_none, label, confidence, inference_ok).
+
+        The captured ndarray is immutable after publication. Ultralytics reads
+        it for preprocessing; only make a full-resolution copy when an
+        annotation window or annotated-frame saving actually needs one.
+        """
         try:
             if self.model is None:
                 raise RuntimeError("YOLO model is not loaded")
@@ -98,7 +108,6 @@ class CrusherCamera:
             if class_id not in names:
                 raise RuntimeError(f"Unknown YOLO class ID: {class_id}")
 
-            # Normalize repeated/internal whitespace in class names.
             label = " ".join(str(names[class_id]).lower().split())
             valid_labels = {
                 "jaw empty", "jaw filled", "jaw partially filled",
@@ -106,37 +115,40 @@ class CrusherCamera:
             if label not in valid_labels:
                 raise RuntimeError(f"Unexpected classification label: {label}")
 
+            annotated = frame.copy() if (not HEADLESS or SAVE_ANNOTATED) else None
             if confidence < CONF_THRESHOLD:
                 log.warning("Low YOLO confidence: %s (%.3f)", label, confidence)
-                return frame.copy(), label, confidence, False
+                return annotated, label, confidence, False
 
-            return frame.copy(), label, confidence, True
+            return annotated, label, confidence, True
 
         except Exception:
             log.exception("YOLO inference failed")
-            return frame.copy(), "unknown", 0.0, False
+            annotated = frame.copy() if (not HEADLESS or SAVE_ANNOTATED) else None
+            return annotated, "unknown", 0.0, False
 
     def connect_rtsp(self):
         if not RTSP_URL:
             raise RuntimeError("RTSP_URL is empty. Set it in the backend .env file.")
 
-        # Stable low-latency FFmpeg configuration.
-        # Avoid nobuffer / zero probing / zero reorder queue: starting between
-        # H.264 keyframes can otherwise lose SPS/PPS and reference packets.
-        transport = os.environ.get("RTSP_TRANSPORT", "tcp").strip().lower()
+        # Low-latency RTSP profile for a wired local network. UDP avoids TCP
+        # head-of-line blocking when a packet is lost. Set RTSP_TRANSPORT=tcp
+        # in .env if UDP is blocked or produces visible packet-loss artifacts.
+        # Keep a small (non-zero) H.264 reorder/probe budget for reliable startup.
+        transport = os.environ.get("RTSP_TRANSPORT", "udp").strip().lower()
         if transport not in {"tcp", "udp"}:
-            log.warning("Invalid RTSP_TRANSPORT=%r; using tcp", transport)
-            transport = "tcp"
+            log.warning("Invalid RTSP_TRANSPORT=%r; using udp", transport)
+            transport = "udp"
 
         ffmpeg_options = [
             f"rtsp_transport;{transport}",
             "fflags;discardcorrupt",
             "flags;low_delay",
-            "max_delay;250000",
-            "reorder_queue_size;16",
-            "probesize;500000",
-            "analyzeduration;1000000",
-            "rw_timeout;5000000",
+            "max_delay;50000",          # 50 ms (was 250 ms)
+            "reorder_queue_size;4",     # was 16
+            "probesize;100000",         # was 500000
+            "analyzeduration;200000",   # was 1000000
+            "rw_timeout;3000000",
         ]
         os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "|".join(ffmpeg_options)
 
@@ -302,7 +314,9 @@ class CrusherCamera:
         # WebRTC/MJPEG carry the video; do not retain a second base64 copy.
         with self._lock:
             self.latest_frame = frame_b64
-            self.fps_actual = float(fps)
+            # camera_fps is the RTSP capture rate; preview_fps is tracked
+            # separately so throttling JPEG preview does not look like a
+            # camera frame-rate drop.
             self.frame_count += 1
             self._last_frame_time = now
             self.status = "live"
@@ -326,6 +340,26 @@ class CrusherCamera:
             seq = self._raw_seq
 
         return (frame.copy() if copy_frame else frame), seq
+
+    def get_raw_frame_snapshot(self, last_seq=-1, timeout=0.0, copy_frame=False):
+        """Atomically return (frame, sequence, monotonic_capture_timestamp).
+
+        Keeping the timestamp under the same condition lock prevents WebRTC
+        diagnostics from accidentally pairing a frame with a newer timestamp.
+        """
+        with self._raw_condition:
+            if timeout > 0:
+                self._raw_condition.wait_for(
+                    lambda: self._raw_seq != last_seq or not self.running,
+                    timeout=float(timeout),
+                )
+            if self._raw_frame is None or self._raw_seq == last_seq:
+                return None, self._raw_seq, self._raw_timestamp
+            frame = self._raw_frame
+            seq = self._raw_seq
+            timestamp = self._raw_timestamp
+
+        return (frame.copy() if copy_frame else frame), seq, timestamp
 
     def get_latest_jpeg(self):
         with self._preview_lock:
@@ -354,6 +388,7 @@ class CrusherCamera:
                 "frame_age_s": round(frame_age, 1) if frame_age is not None else None,
                 "last_error": self.last_error,
                 "capture_fps": round(self.capture_fps, 1),
+                "preview_fps": round(self.preview_fps, 1),
                 "live_frame_count": self.live_frame_count,
                 "live_frame_age_s": (
                     round(time.time() - self.last_live_frame_time, 3)
@@ -414,6 +449,7 @@ class CrusherCamera:
                                     if self.capture_fps <= 0
                                     else 0.2 * instantaneous_fps + 0.8 * self.capture_fps
                                 )
+                                self.fps_actual = self.capture_fps
                     previous_capture_time = capture_now
 
                     with self._raw_condition:
@@ -455,9 +491,14 @@ class CrusherCamera:
         log.info("RTSP capture thread exited")
 
     def _preview_loop(self):
-        """Encode and publish video independently of YOLO inference."""
+        """Publish a rate-limited JPEG preview without touching raw WebRTC frames.
+
+        RTSP capture and WebRTC continue at source FPS. JPEG encoding is capped
+        independently because it is only needed for snapshots/MJPEG fallback.
+        """
         last_seq = 0
         previous_publish_time = None
+        min_interval = 1.0 / PREVIEW_FPS
 
         while self.running:
             with self._raw_condition:
@@ -470,33 +511,32 @@ class CrusherCamera:
                 if self._raw_frame is None or self._raw_seq == last_seq:
                     continue
 
-                # The capture loop publishes a new ndarray per successful read
-                # and never mutates a published ndarray after assigning it.
+                # Published frames are never modified by the capture thread.
                 frame = self._raw_frame
                 last_seq = self._raw_seq
+
+            now = time.monotonic()
+            if previous_publish_time is not None:
+                if now - previous_publish_time < min_interval:
+                    continue
 
             try:
                 ok, buffer = cv2.imencode(
                     ".jpg",
                     frame,
-                    [cv2.IMWRITE_JPEG_QUALITY, 80],
+                    [cv2.IMWRITE_JPEG_QUALITY, PREVIEW_JPEG_QUALITY],
                 )
                 if not ok:
                     log.warning("Preview JPEG encoding failed; dropping frame")
                     continue
 
                 jpeg_bytes = buffer.tobytes()
-                frame_b64 = None
-
-                now = time.monotonic()
-                if previous_publish_time is None:
-                    fps = 0.0
-                else:
-                    interval = now - previous_publish_time
-                    fps = 1.0 / interval if interval > 0 else 0.0
+                fps = (
+                    0.0 if previous_publish_time is None
+                    else 1.0 / max(now - previous_publish_time, 1e-6)
+                )
                 previous_publish_time = now
-
-                self._publish_preview(jpeg_bytes, frame_b64, fps)
+                self._publish_preview(jpeg_bytes, None, fps)
 
             except Exception:
                 log.exception("Preview frame processing failed")
@@ -530,7 +570,10 @@ class CrusherCamera:
                     break
                 if self._raw_frame is None or self._raw_seq == last_seq:
                     continue
-                frame = self._raw_frame.copy()
+                # Capture publishes a fresh ndarray for each sequence and
+                # never mutates it afterward. Inference can read this reference
+                # directly; _infer only copies if annotation output is needed.
+                frame = self._raw_frame
                 last_seq = self._raw_seq
 
             try:
@@ -548,7 +591,7 @@ class CrusherCamera:
                     log.exception("Could not read crusher logic state")
                     crusher_state = {}
 
-                if not HEADLESS:
+                if not HEADLESS and annotated is not None:
                     try:
                         target_rpm = VFD_SPEEDS.get(label, 0)
                         machine_status = crusher_state.get("machine_status", "UNKNOWN")
@@ -582,7 +625,7 @@ class CrusherCamera:
                     except Exception:
                         log.exception("Could not draw camera overlay")
 
-                if SAVE_ANNOTATED:
+                if SAVE_ANNOTATED and annotated is not None:
                     try:
                         os.makedirs(OUTPUT_DIR, exist_ok=True)
                         filename = datetime.now().strftime(
@@ -607,14 +650,13 @@ class CrusherCamera:
                     "inference_confidence": round(float(confidence), 4),
                 })
 
-                if not HEADLESS:
+                if not HEADLESS and annotated is not None:
                     cv2.imshow("Crusher YOLO Live", annotated)
                     if cv2.waitKey(1) & 0xFF == ord("q"):
                         self.running = False
                         break
 
-                # Intentionally no FRAME_INTERVAL sleep: it would add latency.
-                # FRAME_INTERVAL remains imported for compatibility with config.
+                # No inference sleep: process the newest available source frame.
 
             except Exception:
                 log.exception("Frame processing failed")

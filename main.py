@@ -6,6 +6,7 @@ Crusher Monitor — Kannan Blue Metals
 import json
 import logging
 import asyncio
+import cv2
 import os
 import time as _time
 from contextlib import asynccontextmanager
@@ -15,6 +16,7 @@ from aiortc import (
     RTCPeerConnection, RTCSessionDescription, VideoStreamTrack,
     RTCConfiguration, RTCIceServer,
 )
+from aiortc import RTCRtpSender
 from av import VideoFrame
 from fractions import Fraction
 
@@ -324,15 +326,21 @@ class CrusherVideoTrack(VideoStreamTrack):
     """20 FPS latest-frame WebRTC track with bounded, millisecond-scale waits.
 
     It deliberately does not build a frame queue: each send uses the newest
-    captured frame. If no new frame is ready, it repeats the previous frame
-    rather than waiting hundreds of milliseconds and accumulating latency.
+    captured frame. If no new frame is ready, it repeats the previous frame.
+    Scheduling is fixed-rate but does not burst to catch up after a late frame.
     """
 
-    # Match the measured source rate (~18-19 FPS) instead of pacing faster
-    # than the camera and needlessly repeating source frames.
-    TARGET_FPS = 18
+    # Match the camera's measured ~19-20 FPS output.
+    TARGET_FPS = max(
+        1,
+        min(30, int(os.environ.get("WEBRTC_TARGET_FPS", "20")))
+    )
     FRAME_INTERVAL = 1.0 / TARGET_FPS
     CLOCK_RATE = 90000
+    # Keep the camera/YOLO source at native resolution, but reduce WebRTC
+    # encoder workload. Set WEBRTC_MAX_WIDTH=1920 to retain full HD.
+    MAX_WIDTH = max(0, int(os.environ.get("WEBRTC_MAX_WIDTH", "1280")))
+    MAX_HEIGHT = max(0, int(os.environ.get("WEBRTC_MAX_HEIGHT", "720")))
 
     def __init__(self, camera):
         super().__init__()
@@ -356,16 +364,20 @@ class CrusherVideoTrack(VideoStreamTrack):
             await asyncio.sleep(delay)
 
         now = _time.monotonic()
+        # Never try to "catch up" by sending frames in a burst after a
+        # scheduling/encoding delay. If this call is late, restart the cadence
+        # from now; otherwise retain the fixed-rate deadline.
         self._next_frame_time = max(
             self._next_frame_time + self.FRAME_INTERVAL,
-            now + self.FRAME_INTERVAL * 0.05,
+            now + self.FRAME_INTERVAL,
         )
 
-        # A single 5 ms wait maximum; never do repeated 500 ms waits.
-        frame, seq = await asyncio.to_thread(
-            self.camera.get_raw_frame,
+        # Non-blocking latest-frame read. The method only takes a short lock;
+        # avoiding asyncio.to_thread removes executor scheduling overhead from
+        # every frame. No FIFO queue is used, so stale frames cannot accumulate.
+        frame, seq, raw_timestamp = self.camera.get_raw_frame_snapshot(
             self.last_seq,
-            0.005,
+            0.0,
             False,
         )
 
@@ -376,27 +388,28 @@ class CrusherVideoTrack(VideoStreamTrack):
             self.repeated_frames += 1
 
         if self.last_frame is None:
-            # Wait a short time for the first real frame only.
-            frame, seq = await asyncio.to_thread(
-                self.camera.get_raw_frame,
-                self.last_seq,
-                0.05,
-                False,
-            )
-            if frame is not None:
-                self.last_seq = seq
-                self.last_frame = frame
-            else:
-                import numpy as np
-                frame = np.zeros((480, 640, 3), dtype=np.uint8)
+            import numpy as np
+            frame = np.zeros((480, 640, 3), dtype=np.uint8)
         else:
             frame = self.last_frame
 
-        raw_timestamp = getattr(self.camera, "_raw_timestamp", 0.0)
         if raw_timestamp and _time.monotonic() - self._last_age_log >= 5.0:
             age_ms = max(0.0, (_time.monotonic() - raw_timestamp) * 1000.0)
             log.info("WebRTC source-frame age: %.1f ms", age_ms)
             self._last_age_log = _time.monotonic()
+
+        height, width = frame.shape[:2]
+        if (
+            self.MAX_WIDTH > 0 and self.MAX_HEIGHT > 0
+            and (width > self.MAX_WIDTH or height > self.MAX_HEIGHT)
+        ):
+            scale = min(self.MAX_WIDTH / width, self.MAX_HEIGHT / height)
+            out_width = max(2, int(width * scale) // 2 * 2)
+            out_height = max(2, int(height * scale) // 2 * 2)
+            frame = cv2.resize(
+                frame, (out_width, out_height),
+                interpolation=cv2.INTER_AREA,
+            )
 
         video_frame = VideoFrame.from_ndarray(frame, format="bgr24")
         self.frames_sent += 1
@@ -430,14 +443,52 @@ async def webrtc_offer(request: Request):
         @pc.on("connectionstatechange")
         async def on_connectionstatechange():
             log.info("WebRTC peer state: %s", pc.connectionState)
-            if pc.connectionState in ("failed", "closed", "disconnected"):
-                await pc.close()
+            # "disconnected" is often transient (Wi-Fi roam / brief packet
+            # loss). Keep the peer alive so ICE can recover; close only terminal
+            # states. The browser applies its own short disconnect grace period.
+            if pc.connectionState in ("failed", "closed"):
                 webrtc_peers.discard(pc)
+                await pc.close()
 
         pc.addTrack(CrusherVideoTrack(crusher_camera))
         await pc.setRemoteDescription(
             RTCSessionDescription(sdp=sdp, type=offer_type)
         )
+
+        # Prefer software H.264 (libx264 in aiortc/PyAV) for lower
+        # encode/decode overhead where the browser supports it. Keep every
+        # other negotiated video codec after H.264 as a compatibility fallback.
+        video_transceiver = next(
+            (transceiver for transceiver in pc.getTransceivers()
+             if transceiver.kind == "video"),
+            None,
+        )
+        if video_transceiver is not None:
+            video_codecs = RTCRtpSender.getCapabilities("video").codecs
+            h264_codecs = [
+                codec for codec in video_codecs
+                if codec.mimeType.lower() == "video/h264"
+            ]
+            fallback_codecs = [
+                codec for codec in video_codecs
+                if codec.mimeType.lower() != "video/h264"
+            ]
+
+            if h264_codecs:
+                video_transceiver.setCodecPreferences(
+                    h264_codecs + fallback_codecs
+                )
+                log.info(
+                    "WebRTC video codec preference: H.264 first; "
+                    "%d H.264 formats, %d fallback formats",
+                    len(h264_codecs),
+                    len(fallback_codecs),
+                )
+            else:
+                log.warning(
+                    "No H.264 encoder capability found; using default codec order"
+                )
+
         answer = await pc.createAnswer()
         await pc.setLocalDescription(answer)
 
@@ -467,6 +518,7 @@ async def webrtc_status():
                 "connection_state": pc.connectionState,
                 "ice_connection_state": pc.iceConnectionState,
                 "signaling_state": pc.signalingState,
+                "ice_gathering_state": pc.iceGatheringState,
             }
             for pc in list(webrtc_peers)
         ],
