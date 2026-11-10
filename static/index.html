@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Crusher Monitor — Kannan Blue Metals</title>
+  <meta name="description" content="Jaw crusher monitoring and AI feeder / VFD control for Kannan Blue Metals.">
+  <meta name="theme-color" content="#1b2d5b">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Crusher Monitor">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" type="image/png" href="/icons/favicon-32.png">
+  <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500&display=swap">
+  <link rel="stylesheet" href="/css/app.css">
+  <script>
+    // Apply theme before first paint to avoid a flash.
+    (function () {
+      try {
+        var s = JSON.parse(localStorage.getItem('cm.settings') || '{}');
+        var t = s.theme || 'light';
+        if (t === 'system') t = matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+        document.documentElement.setAttribute('data-theme', t);
+      } catch (e) {}
+    })();
+  </script>
+</head>
+<body>
+  <a class="skip-link" href="#view" data-skip hidden>Skip to content</a>
+  <noscript><p style="padding:24px">Crusher Monitor needs JavaScript enabled.</p></noscript>
+  <div id="login-root"></div>
+  <div id="app" class="app" hidden></div>
+  <div id="modal-root"></div>
+  <div id="toast-root" aria-live="polite"></div>
+  <script type="module" src="/js/main.js"></script>
+</body>
+</html>

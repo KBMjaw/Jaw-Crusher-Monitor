@@ -1,0 +1,127 @@
+
+# ==========================================
+# 1. ENVIRONMENT & SECRETS
+# ==========================================
+.env
+.env.*
+!.env.example
+!.env_2.example
+*.pem
+*.key
+*.crt
+secrets/
+credentials/
+
+# ==========================================
+# 2. PYTHON ENVIRONMENT
+# ==========================================
+venv/
+.venv/
+env/
+ENV/
+__pycache__/
+*.py[cod]
+*$py.class
+.python-version
+
+# ==========================================
+# 3. TESTING & COVERAGE
+# ==========================================
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.coveragerc
+test-results/
+junit.xml
+
+# ==========================================
+# 4. DATABASES & IMPORTANT LOCAL DATA
+# ==========================================
+*.db
+*.sqlite
+*.sqlite3
+*.db-shm
+*.db-wal
+*.sqlite-shm
+*.sqlite-wal
+
+# ==========================================
+# 5. CAMERA & DEBUG OUTPUT
+# ==========================================
+debug_output/
+logs/
+*.log
+*.log.*
+crash_reports/
+debug/
+tmp/
+temp/
+
+# ==========================================
+# 6. MODEL WEIGHTS & GENERATED FILES
+# ==========================================
+weights/
+models/
+checkpoints/
+*.pt
+*.pth
+*.onnx
+*.h5
+*.keras
+*.tflite
+*.engine
+
+# ==========================================
+# 7. GENERATED REPORTS & BACKUPS
+# ==========================================
+README.backup.md
+*.bak
+*.backup
+*.old
+*.orig
+*.swp
+*.swo
+*~
+
+# ==========================================
+# 8. PYTHON BUILD ARTIFACTS
+# ==========================================
+build/
+dist/
+*.egg-info/
+.eggs/
+wheels/
+pip-wheel-metadata/
+
+# ==========================================
+# 9. IDE & EDITOR
+# ==========================================
+.vscode/
+.idea/
+*.code-workspace
+.DS_Store
+Thumbs.db
+
+# ==========================================
+# 10. PROJECT-SPECIFIC UNWANTED FILES
+# ==========================================
+camera_backend_search.txt
+.env_1
+
+# ==========================================
+# 11. NODE.JS (IF USED)
+# ==========================================
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# ==========================================
+# 12. SYSTEM TEMPORARY FILES
+# ==========================================
+.cache/
+*.tmp
+*.temp
