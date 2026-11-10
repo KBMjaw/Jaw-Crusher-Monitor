@@ -1,0 +1,16 @@
+venv/
+.venv/
+__pycache__/
+.pytest_cache/
+.git/
+.github/
+tests/
+debug_output/
+logs/
+.env
+.env_*
+*.pyc
+*.log
+*.db
+*.db-shm
+*.db-wal
