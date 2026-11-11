@@ -12,7 +12,7 @@ Edge monitoring for jaw crushers. The system uses a camera and a YOLO model to c
 ## Setup
 
 ```bash
-git clone https://github.com/KBM/Jaw-Crusher-Monitor.git
+git clone https://github.com/KBMjaw/Jaw-Crusher-Monitor.git
 cd Jaw-Crusher-Monitor
 pip install -r requirements.txt
 ```
